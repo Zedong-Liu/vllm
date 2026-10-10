@@ -10,6 +10,9 @@ import numpy as np
 import pytest
 import torch
 
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.compression import (
+    cpp_backend,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.compression.config import (
     MooncakeCompressionConfig,
 )
@@ -62,7 +65,7 @@ def make_manager(monkeypatch):
         config = MooncakeCompressionConfig.from_extra_config(extra)
         if config.uses_codec:
             pytest.importorskip("nvidia.nvcomp")
-        if config.uses_transformer:
+        if config.uses_transformer and not cpp_backend.enabled():
             pytest.importorskip("humming.ops")
         monkeypatch.setattr(
             worker_utils,
@@ -406,6 +409,8 @@ def test_transform_matches_independent_reference(make_manager):
 
 @pytest.mark.parametrize("axis", ["channel", "token", "tensor"])
 def test_quantizer_matches_numpy_reference(make_manager, monkeypatch, axis):
+    if axis == "tensor" and cpp_backend.enabled():
+        monkeypatch.setenv("KVSERVE_COMPRESSION_BACKEND", "python")
     config = {
         "pipeline": ["quantizer"],
         "axis_key": axis,
@@ -476,3 +481,84 @@ def test_wire_profile_compares_representation_not_local_slots(
     producer, _ = make_manager({"slot_count": 1})
     consumer, _ = make_manager({"slot_count": 1, field: value})
     assert (producer.wire_profile == consumer.wire_profile) == compatible
+
+
+@pytest.mark.parametrize(
+    "encoder_backend,decoder_backend", [("python", "cpp"), ("cpp", "python")]
+)
+@pytest.mark.parametrize("axis", ["channel", "token"])
+def test_cross_backend_wire_decode(
+    make_manager, monkeypatch, encoder_backend, decoder_backend, axis
+):
+    config = {
+        "axis_key": axis,
+        "axis_value": axis,
+        "logical_blocks_per_chunk": 2,
+        **dict.fromkeys(
+            (
+                "high_key_num_levels",
+                "low_key_num_levels",
+                "high_value_num_levels",
+                "low_value_num_levels",
+            ),
+            256,
+        ),
+    }
+    monkeypatch.setenv("KVSERVE_COMPRESSION_BACKEND", encoder_backend)
+    producer, _ = make_manager(config)
+    monkeypatch.setenv("KVSERVE_COMPRESSION_BACKEND", decoder_backend)
+    consumer, target = make_manager(config)
+    target.fill_(-9)
+    torch.accelerator.synchronize()
+    for part in (0, 1):
+        monkeypatch.setenv("KVSERVE_COMPRESSION_BACKEND", encoder_backend)
+        encoded = producer.encode(part, [[2, 0]], part, valid_tokens_by_group={0: 31})
+        encoded.event.synchronize()
+        _copy_wire(producer, consumer, encoded, part, 31)
+        monkeypatch.setenv("KVSERVE_COMPRESSION_BACKEND", decoder_backend)
+        consumer.decode(
+            1 - part,
+            [[1, 3]],
+            part,
+            encoded.codec_bytes,
+            encoded.u8_bytes,
+            valid_tokens_by_group={0: 31},
+        ).synchronize()
+        _assert_restored(producer, consumer, part, 31)
+
+
+def test_cpp_sparse_fa_group_uses_cpp_without_fallback(make_manager, monkeypatch):
+    monkeypatch.setenv("KVSERVE_COMPRESSION_BACKEND", "cpp")
+    manager, cache = make_manager({"pipeline": ["codec"]})
+    manager.bind_kv_caches({LAYER_NAME: cache}, {LAYER_NAME: 1})
+    expected = cache[0, :, :, :8].clone()
+    calls = []
+    original = cpp_backend.encode_chunk
+
+    def encode(*args):
+        calls.append(True)
+        return original(*args)
+
+    monkeypatch.setattr(cpp_backend, "encode_chunk", encode)
+    encoded = manager.encode(0, [[], [0]], 0, valid_tokens_by_group={1: 16})
+    encoded.event.synchronize()
+    cache[1].zero_()
+    torch.accelerator.synchronize()
+    manager.decode(
+        0,
+        [[], [1]],
+        0,
+        encoded.codec_bytes,
+        encoded.u8_bytes,
+        valid_tokens_by_group={1: 16},
+    ).synchronize()
+    assert calls == [True]
+    assert torch.equal(cache[1, :, :, :8], expected)
+
+
+def test_cpp_multiple_fa_groups_rejected_at_bind(make_manager, monkeypatch):
+    monkeypatch.setenv("KVSERVE_COMPRESSION_BACKEND", "cpp")
+    manager, _ = make_manager(num_layers=2)
+    caches = manager.pipelines[0].kv_caches
+    with pytest.raises(ValueError, match="requires one FA cache group"):
+        manager.bind_kv_caches(caches, {name: i for i, name in enumerate(caches)})

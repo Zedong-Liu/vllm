@@ -366,6 +366,7 @@ class MooncakeCompressionManager:
             pipeline.layout = execution.layout
             pipeline.stages = execution.config.pipeline
             pipeline.identity_orders = set(execution.identity_layers)
+            pipeline._cpp_metas = None
             self.slot_plans[slot_id] = execution
         return pipeline
 

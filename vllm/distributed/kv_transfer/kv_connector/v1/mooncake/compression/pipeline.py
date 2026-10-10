@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import math
-import os
 import threading
 from dataclasses import dataclass
 
@@ -12,6 +11,7 @@ import torch
 
 from vllm.logger import init_logger
 
+from . import cpp_backend
 from .codec import ANSCodec, EncodedChunk
 from .layout import CompressionLayout, KVPart, LayerPartLayout, QuantSection
 
@@ -59,11 +59,52 @@ class CompressionPipeline:
         self.identity_orders: set[str] = set()
         self.kv_caches: dict[str, torch.Tensor] = {}
         self._cache_parts: dict[tuple[str, KVPart], torch.Tensor] = {}
+        self._cpp_metas: dict[tuple[int, int], torch.Tensor] | None = None
         self.logger = init_logger(__name__)
-        if os.environ.get("KVSERVE_COMPRESSION_BACKEND", "python") != "python":
-            raise ValueError("This implementation supports only the Python backend.")
+        if cpp_backend.enabled():
+            if any(part.dtype is not torch.bfloat16 for part in layout.layer_parts):
+                raise ValueError(
+                    "The CUDA Mooncake backend only supports BF16 KV caches."
+                )
+            if any(
+                section.axis == "tensor"
+                for part in layout.layer_parts
+                for section in part.sections
+            ):
+                raise ValueError(
+                    "The CUDA Mooncake backend does not support tensor-axis "
+                    "quantization yet; use the Python backend."
+                )
+
+    def _use_cpp(self, logical_ids_by_group: list[list[int]]) -> bool:
+        return (
+            cpp_backend.enabled()
+            and "aggregate" not in self.stages
+            and len(self.layout.fa_group_indices) == 1
+        )
+
+    def _cpp_meta(self, slot_id: int, kv_part: int) -> torch.Tensor:
+        if self._cpp_metas is None:
+            self._cpp_metas = {}
+        key = (slot_id, kv_part)
+        meta = self._cpp_metas.get(key)
+        if meta is None:
+            meta = cpp_backend.build_meta(self, self.slots[slot_id], kv_part)
+            self._cpp_metas[key] = meta
+        return meta
 
     def bind_kv_caches(self, kv_caches: dict[str, torch.Tensor]) -> None:
+        if (
+            cpp_backend.enabled()
+            and "aggregate" not in self.stages
+            and len(self.layout.fa_group_indices) != 1
+        ):
+            raise ValueError(
+                "The CUDA compression backend requires one FA cache group; "
+                "use the Python backend for multiple FA groups."
+            )
+        if cpp_backend.enabled() and "aggregate" not in self.stages:
+            cpp_backend.load_kvs_compress(self.stream.device)
         self._cpp_metas = None
         key_sizes = {
             part.layer_name: part.head_size
@@ -504,34 +545,51 @@ class CompressionPipeline:
             slot.arena_b[self.layout.u8_base : self.layout.u8_base + u8_bytes].zero_()
             slot.aux[:aux_bytes].zero_()
             index_cache = self._group_indices(slot, logical_ids_by_group)
-            raw_tail_offset = 0
-            for part in self.layout.parts(kv_part):
-                valid_tokens = valid_tokens_by_group[part.group_index]
-                indices = index_cache[part.group_index]
-                raw_tail_offset = self._pack_raw_tail(
-                    slot, part, indices, valid_tokens, raw_tail_offset
+            if self._use_cpp(logical_ids_by_group):
+                group_index = next(iter(self.layout.fa_group_indices))
+                indices = index_cache[group_index]
+                valid_tokens = valid_tokens_by_group[group_index]
+                cpp_backend.encode_chunk(
+                    self._cpp_meta(slot_id, kv_part),
+                    indices,
+                    indices.numel(),
+                    valid_tokens,
+                    self.stream,
                 )
-                body_tokens = valid_tokens - valid_tokens % part.block_size
-                if not body_tokens:
-                    continue
-                body_blocks = body_tokens // part.block_size * self.blocks_per_logical
-                indices = indices[:body_blocks]
-                # Only complete logical blocks enter any compression stage.
-                gathered_in_b = self._gather_rearrange(slot, part, indices)
-                if "transformer" in self.stages:
-                    self._hadamard_forward(slot, part, indices.numel())
-                elif gathered_in_b:
-                    _, canonical_a, canonical_b = self._layer_views(
-                        slot, part, indices.numel()
+                raw_tail_offset = raw_tail_bytes
+            else:
+                raw_tail_offset = 0
+                for part in self.layout.parts(kv_part):
+                    valid_tokens = valid_tokens_by_group[part.group_index]
+                    indices = index_cache[part.group_index]
+                    raw_tail_offset = self._pack_raw_tail(
+                        slot, part, indices, valid_tokens, raw_tail_offset
                     )
-                    canonical_a.copy_(canonical_b)
-                if quantized:
-                    self._quantize(slot, part, indices.numel(), body_tokens)
-                else:
-                    _, canonical_a, _ = self._layer_views(slot, part, indices.numel())
-                    start = self.layout.u8_base + part.u8_offset * 2
-                    packed = slot.arena_b[start : start + canonical_a.numel() * 2]
-                    packed.copy_(canonical_a.reshape(-1).view(torch.uint8))
+                    body_tokens = valid_tokens - valid_tokens % part.block_size
+                    if not body_tokens:
+                        continue
+                    body_blocks = (
+                        body_tokens // part.block_size * self.blocks_per_logical
+                    )
+                    indices = indices[:body_blocks]
+                    # Only complete logical blocks enter any compression stage.
+                    gathered_in_b = self._gather_rearrange(slot, part, indices)
+                    if "transformer" in self.stages:
+                        self._hadamard_forward(slot, part, indices.numel())
+                    elif gathered_in_b:
+                        _, canonical_a, canonical_b = self._layer_views(
+                            slot, part, indices.numel()
+                        )
+                        canonical_a.copy_(canonical_b)
+                    if quantized:
+                        self._quantize(slot, part, indices.numel(), body_tokens)
+                    else:
+                        _, canonical_a, _ = self._layer_views(
+                            slot, part, indices.numel()
+                        )
+                        start = self.layout.u8_base + part.u8_offset * 2
+                        packed = slot.arena_b[start : start + canonical_a.numel() * 2]
+                        packed.copy_(canonical_a.reshape(-1).view(torch.uint8))
             if not u8_bytes or "codec" not in self.stages:
                 slot.arena_a[:u8_bytes].copy_(
                     slot.arena_b[self.layout.u8_base : self.layout.u8_base + u8_bytes]
@@ -649,28 +707,45 @@ class CompressionPipeline:
                     self.layout.u8_base : self.layout.u8_base + u8_bytes
                 ].copy_(slot.arena_a[:u8_bytes])
             index_cache = self._group_indices(slot, logical_ids_by_group)
-            raw_tail_offset = 0
-            for part in self.layout.parts(kv_part):
-                valid_tokens = valid_tokens_by_group[part.group_index]
-                indices = index_cache[part.group_index]
-                body_tokens = valid_tokens - valid_tokens % part.block_size
-                if body_tokens:
-                    body_blocks = (
-                        body_tokens // part.block_size * self.blocks_per_logical
-                    )
-                    body_indices = indices[:body_blocks]
-                    if quantized:
-                        self._dequantize(slot, part, body_blocks, body_tokens)
-                    else:
-                        _, canonical_a, _ = self._layer_views(slot, part, body_blocks)
-                        start = self.layout.u8_base + part.u8_offset * 2
-                        packed = slot.arena_b[start : start + canonical_a.numel() * 2]
-                        canonical_a.copy_(
-                            packed.view(canonical_a.dtype).view_as(canonical_a)
-                        )
-                    self._inverse_hadamard_scatter(slot, part, body_indices)
-                raw_tail_offset = self._apply_raw_tail(
-                    slot, part, indices, valid_tokens, raw_tail_offset
+            if self._use_cpp(logical_ids_by_group):
+                group_index = next(iter(self.layout.fa_group_indices))
+                indices = index_cache[group_index]
+                valid_tokens = valid_tokens_by_group[group_index]
+                cpp_backend.decode_chunk(
+                    self._cpp_meta(slot_id, kv_part),
+                    indices,
+                    indices.numel(),
+                    valid_tokens,
+                    u8_bytes,
+                    self.stream,
                 )
+            else:
+                raw_tail_offset = 0
+                for part in self.layout.parts(kv_part):
+                    valid_tokens = valid_tokens_by_group[part.group_index]
+                    indices = index_cache[part.group_index]
+                    body_tokens = valid_tokens - valid_tokens % part.block_size
+                    if body_tokens:
+                        body_blocks = (
+                            body_tokens // part.block_size * self.blocks_per_logical
+                        )
+                        body_indices = indices[:body_blocks]
+                        if quantized:
+                            self._dequantize(slot, part, body_blocks, body_tokens)
+                        else:
+                            _, canonical_a, _ = self._layer_views(
+                                slot, part, body_blocks
+                            )
+                            start = self.layout.u8_base + part.u8_offset * 2
+                            packed = slot.arena_b[
+                                start : start + canonical_a.numel() * 2
+                            ]
+                            canonical_a.copy_(
+                                packed.view(canonical_a.dtype).view_as(canonical_a)
+                            )
+                        self._inverse_hadamard_scatter(slot, part, body_indices)
+                    raw_tail_offset = self._apply_raw_tail(
+                        slot, part, indices, valid_tokens, raw_tail_offset
+                    )
             slot.completion_event.record(self.stream)
         return slot.completion_event

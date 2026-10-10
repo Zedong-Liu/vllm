@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Configuration, cache-layout and memory-budget contracts for compression."""
 
+import os
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -11,6 +13,9 @@ from numpy.typing import NDArray
 
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.compression import (
     config as compression_config_module,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.compression import (
+    cpp_backend,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.compression import (
     memory as compression_memory,
@@ -391,6 +396,12 @@ def test_unsupported_cache_dtype_fails_before_allocation(dtype):
         build_compression_layout({"model.layers.0.self_attn": spec}, config, {}, 1)
 
 
+def test_unknown_explicit_backend_does_not_silently_use_python(monkeypatch):
+    monkeypatch.setenv("KVSERVE_COMPRESSION_BACKEND", "cpo")
+    with pytest.raises(ValueError, match="Unknown KVSERVE_COMPRESSION_BACKEND"):
+        cpp_backend.enabled()
+
+
 @pytest.mark.parametrize("tp_rank", range(8))
 def test_head_selection_maps_replicated_kv_heads(tp_rank):
     config = MooncakeCompressionConfig(
@@ -418,8 +429,28 @@ def test_head_selection_rejects_invalid_score_shape_and_values(scores):
         )
 
 
-def test_cache_binding_keeps_asymmetric_kv_views(monkeypatch):
-    monkeypatch.setenv("KVSERVE_COMPRESSION_BACKEND", "python")
+def test_cpp_jit_uses_worker_device_and_respects_explicit_arch(monkeypatch):
+    device = torch.device("cuda", 3)
+    capability = Mock(return_value=(12, 0))
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", capability)
+    monkeypatch.setattr(cpp_backend, "load", Mock())
+    monkeypatch.delenv("TORCH_CUDA_ARCH_LIST", raising=False)
+    monkeypatch.setattr(cpp_backend, "_module", None)
+    cpp_backend.load_kvs_compress(device)
+    capability.assert_called_once_with(device)
+
+    assert os.environ["TORCH_CUDA_ARCH_LIST"] == "12.0"
+    monkeypatch.setenv("TORCH_CUDA_ARCH_LIST", "9.0;12.0")
+    monkeypatch.setattr(cpp_backend, "_module", None)
+    cpp_backend.load_kvs_compress(device)
+    assert os.environ["TORCH_CUDA_ARCH_LIST"] == "9.0;12.0"
+
+
+def test_cpp_cache_binding_loads_backend_and_keeps_asymmetric_kv_views(monkeypatch):
+    monkeypatch.setenv("KVSERVE_COMPRESSION_BACKEND", "cpp")
+    load = Mock()
+    monkeypatch.setattr(cpp_backend, "load_kvs_compress", load)
     parts = tuple(
         SimpleNamespace(
             layer_name="layer",
@@ -444,10 +475,22 @@ def test_cache_binding_keeps_asymmetric_kv_views(monkeypatch):
     )
     cache = torch.arange(96, dtype=torch.bfloat16).reshape(2, 2, 24)
     pipeline.bind_kv_caches({"layer": cache})
+    load.assert_called_once_with(device)
     for part, expected in zip(parts, (cache[..., :8], cache[..., 8:])):
         view = pipeline._cache_part(part)
         assert view.data_ptr() == expected.data_ptr()
         torch.testing.assert_close(view, expected)
+
+    # Cache rebinding must discard metadata containing old cache pointers.
+    build = Mock(side_effect=[torch.tensor([1]), torch.tensor([2])])
+    monkeypatch.setattr(cpp_backend, "build_meta", build)
+    pipeline.slots.append(SimpleNamespace())
+    original = pipeline._cpp_meta(0, 0)
+    assert pipeline._cpp_meta(0, 0) is original
+    assert build.call_count == 1
+    pipeline.bind_kv_caches({"layer": cache.clone()})
+    assert pipeline._cpp_meta(0, 0) is not original
+    assert build.call_count == 2
 
 
 def test_mixed_fa_block_sizes_are_rejected_before_gpu_allocation():

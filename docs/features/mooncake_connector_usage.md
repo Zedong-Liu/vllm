@@ -136,8 +136,10 @@ the connector pool requires additional memory.
 Head profiles use `split_type=head` and `score_path` pointing to a finite
 layer-by-global-KV-head score matrix. Both workers need identical profile
 contents. Channel, token, and tensor quantization axes are supported by Python.
-The initial implementation uses the Python backend. CUDA acceleration is
-prepared separately in the follow-up change.
+The optional CUDA backend (`KVSERVE_COMPRESSION_BACKEND=cpp`) supports one
+FullAttention group and channel/token axes. It needs a matching CUDA toolkit,
+C++ compiler, and Ninja, and compiles during cache binding before requests.
+It preserves the wire profile of compatible Python configurations.
 
 The supported stage order is `transformer`, `quantizer`, `codec`; stages may
 be omitted. ANS is lossless coding, while quantization is lossy. Setting
